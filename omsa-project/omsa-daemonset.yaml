@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dell-omsa
+  namespace: omsa
+spec:
+  selector:
+    matchLabels:
+      app: omsa
+  template:
+    metadata:
+      labels:
+        app: omsa
+    spec:
+      hostNetwork: true
+      hostPID: true
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: hardware-vendor
+                operator: In
+                values:
+                - dell
+      containers:
+      - name: omsa
+        image: sarthaktech76/omsa-ubuntu:11.1
+        securityContext:
+          privileged: true
+        # Resource Limits to ensure OMSA stays lightweight
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        env:
+        - name: PATH
+          value: "/opt/dell/srvadmin/bin:/opt/dell/srvadmin/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        - name: LD_LIBRARY_PATH
+          value: "/opt/dell/srvadmin/lib64:/opt/dell/srvadmin/lib"
+        volumeMounts:
+        - name: dev
+          mountPath: /dev
+        - name: sys
+          mountPath: /sys
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+      volumes:
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules

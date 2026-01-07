@@ -1,0 +1,41 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Install system dependencies
+RUN apt-get update && apt-get install -y \
+    wget unzip perl libssl-dev libcurl4 libncurses5 \
+    libxslt1.1 libgpm2 kmod udev iproute2 pciutils dmidecode \
+    && apt-get clean
+
+# 2. Setup hardware stubs
+RUN ln -sf /bin/true /bin/systemctl && \
+    ln -sf /bin/true /sbin/udevadm
+
+# 3. CRITICAL: Set OMSA Environment Variables
+ENV PATH="/opt/dell/srvadmin/bin:/opt/dell/srvadmin/sbin:$PATH"
+ENV LD_LIBRARY_PATH="/opt/dell/srvadmin/lib64:/opt/dell/srvadmin/lib:$LD_LIBRARY_PATH"
+ENV G_BROKEN_FILENAMES=1
+
+WORKDIR /tmp/omsa
+
+# 4. Download and Install
+RUN wget --user-agent="Mozilla/5.0" https://dl.dell.com/FOLDER12513886M/1/OM11100_APT_REPO_A01.zip
+RUN unzip OM11100_APT_REPO_A01.zip && \
+    find . -name "*.deb" > deb_list.txt && \
+    (dpkg -i $(cat deb_list.txt) || true) && \
+    apt-get install -y -f && \
+    dpkg --configure -a || true
+
+# 5. Fix library paths permanently
+RUN echo "/opt/dell/srvadmin/lib64" > /etc/ld.so.conf.d/omsa.conf && \
+    echo "/opt/dell/srvadmin/lib" >> /etc/ld.so.conf.d/omsa.conf && \
+    ldconfig
+
+RUN rm -rf /tmp/omsa/*
+
+EXPOSE 1311
+
+# 6. Optimized Startup
+# We run the "srvadmin-services.sh start" which creates the missing .ini links 
+CMD /opt/dell/srvadmin/sbin/srvadmin-services.sh start && tail -f /dev/null
