@@ -1,0 +1,353 @@
+#!/bin/bash
+# ========================================================
+# Wasabi Audit Bot - Service Version Checker + Slack Sender
+# ========================================================
+
+# ---------- Color codes ----------
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+# ---------- SSH options ----------
+SSH_USER="ba"
+SSH_PASSWORD="21MrT1952"
+SSH_OPTIONS="-q -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+# ---------- Vaults ----------
+VAULTS=(
+  "ashburn" "hillsboro" "ams" "mnx" "tk10" "dfw1" "os7" "ld7"
+  "pa3" "fr2" "tr6" "sy5" "sg4" "ma3" "lh13" "svy1"
+)
+SINGLE_ZONES=("general" "head1")
+
+# ---------- Slack & CSV Config ----------
+#SLACK_WEBHOOK_URL=""
+SLACK_CHANNEL=""
+SLACK_USERNAME="Wasabi Audit Bot"
+CSV_FILE_PATH="/home/users/svasant/service-audit/service-audit-$(date +%Y%m%d_%H%M%S).csv"
+
+# ============= Slack Notification Function =============
+send_output_to_slack() {
+  local zone_name="$1"
+  local message="$2"
+  local maxlen=2500
+
+  # Strip ANSI escape codes
+  message=$(echo "$message" | sed 's/\x1b\[[0-9;]*m//g')
+
+  # Escape JSON-sensitive chars
+  local escaped=$(echo "$message" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+  local heading="*Namespaces / Services / Images for ${zone_name}*"
+
+  local current_chunk=""
+  while IFS= read -r line; do
+    if (( ${#current_chunk} + ${#line} + 1 > maxlen )); then
+      payload=$(cat <<EOF
+{
+  "channel": "$SLACK_CHANNEL",
+  "username": "$SLACK_USERNAME",
+  "text": "$heading\n\n\`\`\`\n$current_chunk\n\`\`\`"
+}
+EOF
+)
+      curl -s -X POST -H 'Content-type: application/json' \
+        --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
+      current_chunk="$line"
+    else
+      if [ -z "$current_chunk" ]; then
+        current_chunk="$line"
+      else
+        current_chunk="$current_chunk\n$line"
+      fi
+    fi
+  done <<< "$escaped"
+
+  if [ -n "$current_chunk" ]; then
+    payload=$(cat <<EOF
+{
+  "channel": "$SLACK_CHANNEL",
+  "username": "$SLACK_USERNAME",
+  "text": "$heading\n\n\`\`\`\n$current_chunk\n\`\`\`"
+}
+EOF
+)
+    curl -s -X POST -H 'Content-type: application/json' \
+      --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
+  fi
+}
+
+# ========================================================
+# >>>>>>>>>>>>>> CSV EXPORT FUNCTION <<<<<<<<<<<<<<<<
+# ========================================================
+create_csv() {
+    local zone_name="$1"
+    local data="$2"
+
+    if [ ! -f "$CSV_FILE_PATH" ]; then
+        echo "ZONE,NAMESPACE,SERVICE,IMAGE" > "$CSV_FILE_PATH"
+    fi
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*\|[[:space:]]*([^[:space:]].*)\|[[:space:]]*([^[:space:]].*)\|[[:space:]]*(.*)[[:space:]]*\|$ ]]; then
+            local namespace=$(echo "${BASH_REMATCH[1]}" | xargs)
+            local service=$(echo "${BASH_REMATCH[2]}" | xargs)
+            local image=$(echo "${BASH_REMATCH[3]}" | xargs)
+            echo "$zone_name,\"$namespace\",\"$service\",\"$image\"" >> "$CSV_FILE_PATH"
+        fi
+    done <<< "$data"
+
+    echo -e "${GREEN}✅ Data for ${zone_name} appended to $CSV_FILE_PATH${NC}"
+}
+
+# ========================================================
+# >>>>>>>>>>>> DISCOVERY FUNCTIONS <<<<<<<<<<
+# ========================================================
+print_vaults() {
+  echo "Available Vaults:"
+  for i in "${!VAULTS[@]}"; do
+    printf "%2d. %s\n" $((i + 1)) "${VAULTS[$i]^}"
+  done
+}
+
+discover_storage_zones_for_vault() {
+  local vault_name="$1"
+  local vault_index="$2"
+  local region="prod${vault_index}.${vault_name}"
+  local zone_index=1
+  local failure_streak=0
+  local max_failures=3
+  local discovered=()
+  while true; do
+    local zone="storage${zone_index}"
+    local consul_url="http://${zone}.${region}:8500/v1/catalog/service/zfs-monitor"
+    local response=$(curl -s --max-time 3 "$consul_url")
+    if [[ -z "$response" || "$response" == "null" ]]; then
+      ((failure_streak++))
+      if (( failure_streak >= max_failures )); then break; fi
+      ((zone_index++))
+      continue
+    fi
+    failure_streak=0
+    discovered+=("${zone}.${region}")
+    ((zone_index++))
+  done
+  echo "${discovered[*]}"
+}
+
+discover_crdb_zones_for_vault() {
+  local vault_name="$1"
+  local vault_index="$2"
+  local region="prod${vault_index}.${vault_name}"
+  local zone_index=1
+  local failure_streak=0
+  local max_failures=3
+  local discovered=()
+  while true; do
+    local zone="crdb${zone_index}"
+    local consul_url="http://${zone}.${region}:8500/v1/catalog/service/zfs-monitor"
+    local response=$(curl -s --max-time 3 "$consul_url")
+    if [[ -z "$response" || "$response" == "null" ]]; then
+      ((failure_streak++))
+      if (( failure_streak >= max_failures )); then break; fi
+      ((zone_index++))
+      continue
+    fi
+    failure_streak=0
+    discovered+=("${zone}.${region}")
+    ((zone_index++))
+  done
+  echo "${discovered[*]}"
+}
+
+# ========================================================
+# >>>>>>>>>>>> IMAGE CHECK FUNCTION <<<<<<<<<<
+# ========================================================
+display_versions_by_namespace() {
+  local cmd="kubectl get deployments,statefulsets,daemonsets --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}{\"\\t\"}{.metadata.name}{\"\\t\"}{range .spec.template.spec.containers[*]}{.image}{\"\\n\"}{end}{end}'"
+  local version_output=$(sshpass -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$SSH_USER@$TARGET_ZONE" "$cmd" 2>/dev/null)
+
+  if [[ $? -ne 0 || -z "$version_output" ]]; then
+    echo -e "${RED}❌ Failed to get service data from ${TARGET_ZONE}${NC}"
+    return 1
+  fi
+
+  declare -A image_counts
+  declare -A image_namespaces
+  declare -A image_services
+
+  while IFS=$'\t' read -r namespace service_name image; do
+      if [[ -n "$image" ]]; then
+        image_counts["$image"]=$(( ${image_counts["$image"]:-0} + 1 ))
+        if [[ -n "${image_namespaces[$image]}" ]]; then
+            if [[ ! ",${image_namespaces[$image]}," =~ ",$namespace," ]]; then
+                image_namespaces["$image"]+=",${namespace}"
+            fi
+        else
+            image_namespaces["$image"]="$namespace"
+        fi
+        if [[ -n "${image_services[$image]}" ]]; then
+            if [[ ! ",${image_services[$image]}," =~ ",$service_name," ]]; then
+                image_services["$image"]+=",${service_name}"
+            fi
+        else
+            image_services["$image"]="$service_name"
+        fi
+      fi
+  done <<< "$version_output"
+
+  {
+    echo "SERVICES / IMAGES for ${TARGET_ZONE}"
+    printf " +-%-25s-+-%-45s-+-%-65s-+\n" \
+              "-------------------------" "---------------------------------------------" "-----------------------------------------------------------------"
+    printf " | %-25s | %-45s | %-65s |\n" \
+              "NAMESPACE" "SERVICE" "IMAGE"
+    printf " +-%-25s-+-%-45s-+-%-65s-+\n" \
+              "-------------------------" "---------------------------------------------" "-----------------------------------------------------------------"
+
+    for image in "${!image_counts[@]}"; do
+        local namespaces_list=${image_namespaces[$image]}
+        local services_list=${image_services[$image]}
+        printf " | %-25s | %-45s | %-65s |\n" "$namespaces_list" "$services_list" "$image"
+    done | sort -k2
+
+    printf " +-%-25s-+-%-45s-+-%-65s-+\n" \
+              "-------------------------" "---------------------------------------------" "-----------------------------------------------------------------"
+  }
+}
+
+# ========================================================
+# >>>>>>>>>>>> TARGET ZONE SELECTION <<<<<<<<<<
+# ========================================================
+if [[ -n "$1" ]]; then
+  TARGET_ZONE="$1"
+else
+  for i in "${!VAULTS[@]}"; do
+    printf "%2d. %s (prod%d)\n" $((i + 1)) "${VAULTS[$i]^}" $((i + 1))
+  done
+  echo "17. All Vaults"
+  echo -ne "\nSelect vault (1-17) [Default: 17 in 30s]: "
+
+  if ! read -t 30 -r vault_choice; then
+    echo -e "\n${YELLOW}⏰ No input received. Defaulting to Option 17 (ALL Vaults).${NC}"
+    vault_choice=17
+  fi
+
+  if [[ $vault_choice -eq 17 ]]; then
+    TARGET_ZONE="ALL_VAULTS"
+  elif [[ $vault_choice -ge 1 && $vault_choice -le ${#VAULTS[@]} ]]; then
+    selected_vault="${VAULTS[$((vault_choice-1))]}"
+    prod_number=$vault_choice
+    echo "1. general.prod${prod_number}.${selected_vault}"
+    echo "2. head1.prod${prod_number}.${selected_vault}"
+    echo "3. storage zones (auto-discovered)"
+    echo "4. crdb zones (auto-discovered)"
+    echo "5. All zones in this vault"
+    echo -ne "\nSelect zone option (1-5) [Default: 5 in 30s]: "
+
+    if ! read -t 30 -r zone_choice; then
+      echo -e "\n${YELLOW}⏰ No input received. Defaulting to Option 5 (All zones in this vault).${NC}"
+      zone_choice=5
+    fi
+
+    case $zone_choice in
+      1) TARGET_ZONE="general.prod${prod_number}.${selected_vault}" ;;
+      2) TARGET_ZONE="head1.prod${prod_number}.${selected_vault}" ;;
+      3)
+        echo -e "\n${YELLOW}Discovering storage zones...${NC}"
+        storage_hosts=$(discover_storage_zones_for_vault "$selected_vault" "$prod_number")
+        if [[ -n "$storage_hosts" ]]; then
+          echo -e "${GREEN}Found storage zones:${NC}"
+          select host in $storage_hosts; do
+            TARGET_ZONE="$host"
+            break
+          done
+        else
+          echo -e "${RED}No storage zones found${NC}"; exit 1
+        fi ;;
+      4)
+        echo -e "\n${YELLOW}Discovering crdb zones...${NC}"
+        crdb_hosts=$(discover_crdb_zones_for_vault "$selected_vault" "$prod_number")
+        if [[ -n "$crdb_hosts" ]]; then
+          echo -e "${GREEN}Found crdb zones:${NC}"
+          select host in $crdb_hosts; do
+            TARGET_ZONE="$host"
+            break
+          done
+        else
+          echo -e "${RED}No crdb zones found${NC}"; exit 1
+        fi ;;
+      5) TARGET_ZONE="VAULT_${selected_vault}_${prod_number}" ;;
+      *) echo -e "${RED}Invalid selection${NC}"; exit 1 ;;
+    esac
+  else
+    echo -e "${RED}Invalid vault selection${NC}"; exit 1
+  fi
+fi
+
+# ========================================================
+# >>>>>>>>>>>> MAIN EXECUTION <<<<<<<<<<
+# ========================================================
+if [[ "$TARGET_ZONE" == "ALL_VAULTS" ]]; then
+  for i in "${!VAULTS[@]}"; do
+    vault="${VAULTS[$i]}"; prod_number=$((i+1))
+    for zone in "${SINGLE_ZONES[@]}"; do
+      host="${zone}.prod${prod_number}.${vault}"
+      TARGET_ZONE="$host"
+      output=$(display_versions_by_namespace)
+      echo "$output"
+      send_output_to_slack "$TARGET_ZONE" "$output"
+      create_csv "$TARGET_ZONE" "$output"
+    done
+    storage_hosts=$(discover_storage_zones_for_vault "$vault" "$prod_number")
+    for host in $storage_hosts; do
+      TARGET_ZONE="$host"
+      output=$(display_versions_by_namespace)
+      echo "$output"
+      send_output_to_slack "$TARGET_ZONE" "$output"
+      create_csv "$TARGET_ZONE" "$output"
+    done
+    crdb_hosts=$(discover_crdb_zones_for_vault "$vault" "$prod_number")
+    for host in $crdb_hosts; do
+      TARGET_ZONE="$host"
+      output=$(display_versions_by_namespace)
+      echo "$output"
+      send_output_to_slack "$TARGET_ZONE" "$output"
+      create_csv "$TARGET_ZONE" "$output"
+    done
+  done
+elif [[ "$TARGET_ZONE" == VAULT_* ]]; then
+  IFS='_' read -r _ vault_name prod_number <<< "$TARGET_ZONE"
+  for zone in "${SINGLE_ZONES[@]}"; do
+    host="${zone}.prod${prod_number}.${vault_name}"
+    TARGET_ZONE="$host"
+    output=$(display_versions_by_namespace)
+    echo "$output"
+    send_output_to_slack "$TARGET_ZONE" "$output"
+    create_csv "$TARGET_ZONE" "$output"
+  done
+  storage_hosts=$(discover_storage_zones_for_vault "$vault_name" "$prod_number")
+  for host in $storage_hosts; do
+    TARGET_ZONE="$host"
+    output=$(display_versions_by_namespace)
+    echo "$output"
+    send_output_to_slack "$TARGET_ZONE" "$output"
+    create_csv "$TARGET_ZONE" "$output"
+  done
+  crdb_hosts=$(discover_crdb_zones_for_vault "$vault_name" "$prod_number")
+  for host in $crdb_hosts; do
+    TARGET_ZONE="$host"
+    output=$(display_versions_by_namespace)
+    echo "$output"
+    send_output_to_slack "$TARGET_ZONE" "$output"
+    create_csv "$TARGET_ZONE" "$output"
+  done
+else
+  output=$(display_versions_by_namespace)
+  echo "$output"
+  send_output_to_slack "$TARGET_ZONE" "$output"
+  create_csv "$TARGET_ZONE" "$output"
+fi
+
